@@ -125,14 +125,22 @@ def load_model(model_type: str, args):
 
 def postprocess(speech, sample_rate, top_db=60, hop_length=220, win_length=440):
     max_val = 0.8
-    speech, _ = librosa.effects.trim(
-        speech, top_db=top_db,
+    device = speech.device if torch.is_tensor(speech) else None
+    speech_np = speech.detach().cpu().numpy() if torch.is_tensor(speech) else speech
+    speech_np, _ = librosa.effects.trim(
+        speech_np, top_db=top_db,
         frame_length=win_length,
         hop_length=hop_length
     )
+    speech = torch.from_numpy(speech_np).to(device=device, dtype=torch.float32)
+    if speech.dim() == 1:
+        speech = speech.unsqueeze(0)
     if speech.abs().max() > max_val:
         speech = speech / speech.abs().max() * max_val
-    speech = torch.concat([speech, torch.zeros(1, int(sample_rate * 0.2))], dim=1)
+    speech = torch.concat([
+        speech,
+        torch.zeros(speech.shape[0], int(sample_rate * 0.2), device=speech.device, dtype=speech.dtype)
+    ], dim=1)
     return speech
 
 def base64_to_wav(encoded_str, output_path: Path):
