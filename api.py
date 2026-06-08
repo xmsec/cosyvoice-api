@@ -7,6 +7,7 @@ from logging.handlers import RotatingFileHandler
 import subprocess
 import datetime
 import base64
+import json
 import librosa
 import random
 from cosyvoice.utils.common import set_all_random_seed
@@ -18,7 +19,10 @@ from flask import Flask, request, jsonify, send_file, make_response
 # --- Global Model Placeholders ---
 sft_model = None
 tts_model = None
+instruct_model = None
 VOICE_LIST = ['中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女']
+VOICE_PROFILES = {}
+DEFAULT_API_KEY = 'ppt-master-cosyvoice-local-key'
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -40,6 +44,24 @@ def setup_logging(logs_dir: Path):
     file_handler.setLevel(logging.WARNING)
     file_handler.setFormatter(formatter)
     app.logger.addHandler(file_handler)
+
+def require_api_auth():
+    args = app.config.get('args')
+    api_key = (getattr(args, 'api_key', '') if args else '') or ''
+    if not api_key:
+        return None
+
+    auth_header = request.headers.get('Authorization', '')
+    expected = f'Bearer {api_key}'
+    if auth_header == expected:
+        return None
+
+    return jsonify({
+        "error": {
+            "message": "Unauthorized",
+            "type": "authentication_error",
+        }
+    }), 401
 
 # --- Core Functions ---
 
@@ -63,10 +85,10 @@ def setup_environment():
 def load_model(model_type: str, args):
     """
     Loads a specified model, downloading it if necessary and allowed.
-    `model_type` can be 'sft' or 'tts'.
+    `model_type` can be 'sft', 'tts', or 'instruct'.
     """
-    global sft_model, tts_model
-    from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2
+    global sft_model, tts_model, instruct_model
+    from cosyvoice.cli.cosyvoice import AutoModel, CosyVoice
     from modelscope import snapshot_download
 
     models_dir = Path(args.models_dir)
@@ -76,9 +98,13 @@ def load_model(model_type: str, args):
         local_dir = models_dir / 'CosyVoice-300M-SFT'
         if sft_model is not None: return
     elif model_type == 'tts':
-        model_id = 'iic/CosyVoice2-0.5B'
-        local_dir = models_dir / 'CosyVoice2-0.5B'
+        model_id = 'FunAudioLLM/Fun-CosyVoice3-0.5B-2512'
+        local_dir = models_dir / 'Fun-CosyVoice3-0.5B'
         if tts_model is not None: return
+    elif model_type == 'instruct':
+        model_id = 'iic/CosyVoice-300M-Instruct'
+        local_dir = models_dir / 'CosyVoice-300M-Instruct'
+        if instruct_model is not None: return
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -92,7 +118,9 @@ def load_model(model_type: str, args):
     if model_type == 'sft':
         sft_model = CosyVoice(str(local_dir), load_jit=False, fp16=False)
     elif model_type == 'tts':
-        tts_model = CosyVoice2(str(local_dir), load_jit=False, fp16=False)
+        tts_model = AutoModel(model_dir=str(local_dir), fp16=False)
+    elif model_type == 'instruct':
+        instruct_model = CosyVoice(str(local_dir), load_jit=False, fp16=False)
     print(f"Model {model_type} loaded successfully.")
 
 def postprocess(speech, sample_rate, top_db=60, hop_length=220, win_length=440):
@@ -114,6 +142,286 @@ def base64_to_wav(encoded_str, output_path: Path):
     with open(output_path, "wb") as wav_file:
         wav_file.write(wav_bytes)
     print(f"WAV file has been saved to {output_path}")
+
+def load_voice_profiles(config_path: str | None) -> dict:
+    """Load server-side voice profiles keyed by public voice id."""
+    if not config_path:
+        return {}
+
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Voice config not found: {path}")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("voices"), list):
+        profiles = {item["id"]: item for item in data["voices"] if item.get("id")}
+    elif isinstance(data, dict):
+        profiles = data
+    else:
+        raise ValueError("Voice config must be a JSON object or an object with a voices list.")
+
+    for voice_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValueError(f"Voice profile '{voice_id}' must be an object.")
+    return profiles
+
+def normalize_tts_type(mode: str | None) -> str:
+    normalized = (mode or "tts").strip().lower()
+    if normalized in {"tts", "sft"}:
+        return "tts"
+    if normalized in {"clone_eq", "zero_shot", "same_language"}:
+        return "clone_eq"
+    if normalized in {"clone", "clone_mul", "cross_lingual"}:
+        return "clone_mul"
+    if normalized in {"instruct", "instruct2", "instruction", "cosyvoice2_instruct"}:
+        return "instruct2"
+    if normalized in {"instruct_sft", "sft_instruct", "cosyvoice_instruct"}:
+        return "instruct"
+    raise ValueError(f"Unsupported voice profile mode: {mode}")
+
+def normalize_instruction(instruction: str | None, *, append_end_marker: bool = True) -> str:
+    value = (instruction or "").strip()
+    if value and append_end_marker and "<|endofprompt|>" not in value:
+        value += "<|endofprompt|>"
+    return value
+
+def normalize_language_hint(language_hints) -> str:
+    if not language_hints:
+        return ""
+    if isinstance(language_hints, str):
+        raw_hint = language_hints
+    elif isinstance(language_hints, list) and language_hints:
+        raw_hint = str(language_hints[0])
+    else:
+        return ""
+
+    normalized = raw_hint.strip().lower().replace("_", "-")
+    hint_map = {
+        "zh": "zh",
+        "zh-cn": "zh",
+        "chinese": "zh",
+        "cn": "zh",
+        "en": "en",
+        "en-us": "en",
+        "english": "en",
+        "ja": "ja",
+        "jp": "ja",
+        "ja-jp": "ja",
+        "japanese": "ja",
+        "yue": "yue",
+        "cantonese": "yue",
+        "zh-hk": "yue",
+        "ko": "ko",
+        "ko-kr": "ko",
+        "korean": "ko",
+    }
+    return hint_map.get(normalized, "")
+
+def apply_language_hint(text: str, language_hints) -> str:
+    hint = normalize_language_hint(language_hints)
+    if not hint or text.lstrip().startswith("<|"):
+        return text
+    return f"<|{hint}|>{text}"
+
+def resolve_voice_profile(voice: str, input_payload: dict, args) -> tuple[str, dict]:
+    """Resolve a public voice id to internal CosyVoice params.
+
+    The public API stays simple: clients pass only `voice`. Clone reference
+    audio/text stay on the API server in --voices-config.
+    """
+    if not voice:
+        raise ValueError("Missing input.voice")
+
+    profiles = app.config.get("voice_profiles", {})
+    profile = profiles.get(voice)
+
+    if profile:
+        tts_type = normalize_tts_type(profile.get("mode") or profile.get("type"))
+        instruction = input_payload.get("instruction") or profile.get("instruction") or profile.get("instruct_text")
+        append_end_marker = bool(profile.get("append_end_marker", True))
+        params = {
+            "role": profile.get("role") or profile.get("speaker") or "中文女",
+            "reference_audio": profile.get("reference_audio"),
+            "reference_text": profile.get("reference_text") or profile.get("prompt_text") or "",
+            "instruction": normalize_instruction(instruction, append_end_marker=append_end_marker),
+            "zero_shot_spk_id": profile.get("zero_shot_spk_id") or "",
+            "text_frontend": bool(profile.get("text_frontend", True)),
+            "seed": int(profile.get("seed", input_payload.get("seed", args.seed))),
+            "speed": float(input_payload.get("rate") or input_payload.get("speed") or profile.get("speed", 1.0)),
+        }
+        return tts_type, params
+
+    if voice in VOICE_LIST:
+        return "tts", {
+            "role": voice,
+            "reference_audio": None,
+            "reference_text": "",
+            "instruction": normalize_instruction(input_payload.get("instruction")),
+            "zero_shot_spk_id": "",
+            "text_frontend": True,
+            "seed": int(input_payload.get("seed", args.seed)),
+            "speed": float(input_payload.get("rate") or input_payload.get("speed") or 1.0),
+        }
+
+    if app.config.get("strict_voice_profiles", False):
+        available = sorted(list(profiles.keys()) + VOICE_LIST)
+        raise ValueError(f"Unknown voice '{voice}'. Available voices: {', '.join(available)}")
+
+    # Backward compatibility with the old OpenAI-compatible endpoint: a
+    # non-built-in voice can still be a server-side reference audio path.
+    return "clone_mul", {
+        "role": "中文女",
+        "reference_audio": voice,
+        "reference_text": "",
+        "instruction": normalize_instruction(input_payload.get("instruction")),
+        "zero_shot_spk_id": "",
+        "text_frontend": True,
+        "seed": int(input_payload.get("seed", args.seed)),
+        "speed": float(input_payload.get("rate") or input_payload.get("speed") or 1.0),
+    }
+
+def build_audio_url(outfile: str) -> str:
+    filename = Path(outfile).name
+    static_prefix = app.static_url_path.rstrip("/")
+    public_base_url = (getattr(app.config.get("args"), "public_base_url", "") or "").rstrip("/")
+    base_url = public_base_url or request.url_root.rstrip("/")
+    return base_url + f"{static_prefix}/{filename}"
+
+def dashscope_response(outfile: str, *, model: str, voice: str, audio_format: str) -> dict:
+    return {
+        "output": {
+            "audio": {
+                "url": build_audio_url(outfile),
+                "format": audio_format,
+            }
+        },
+        "usage": {},
+        "request_id": f"local-cosyvoice-{int(time.time() * 1000)}",
+        "model": model,
+        "voice": voice,
+    }
+
+def parse_optional_int(value, name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+
+def parse_optional_float(value, name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number.") from exc
+
+def convert_generated_audio(
+    outfile: str,
+    audio_format: str,
+    *,
+    sample_rate: int | None = None,
+    volume: int | None = None,
+    pitch: float | None = None,
+) -> str:
+    if audio_format not in {"wav", "mp3"}:
+        raise ValueError("Local CosyVoice currently supports format=wav or format=mp3.")
+    if sample_rate is not None and sample_rate <= 0:
+        raise ValueError("sample_rate must be a positive integer.")
+    if volume is not None and not 0 <= volume <= 100:
+        raise ValueError("volume must be between 0 and 100.")
+    if pitch is not None and not 0.5 <= pitch <= 2.0:
+        raise ValueError("pitch must be between 0.5 and 2.0.")
+    if pitch is not None and sample_rate is None:
+        raise ValueError("pitch post-processing requires sample_rate.")
+
+    needs_transcode = audio_format != "wav" or sample_rate is not None or volume is not None or pitch is not None
+    if not needs_transcode:
+        return outfile
+
+    source = Path(outfile)
+    suffix = ".mp3" if audio_format == "mp3" else ".wav"
+    target = source.with_name(f"{source.stem}-out{suffix}")
+    cmd = ["ffmpeg", "-y", "-i", str(source)]
+
+    filters = []
+    if pitch is not None:
+        shifted_rate = max(1, int(sample_rate * pitch))
+        filters.append(f"asetrate={shifted_rate},aresample={sample_rate},atempo={1 / pitch}")
+    if volume is not None:
+        filters.append(f"volume={volume / 50.0}")
+    if filters:
+        cmd.extend(["-af", ",".join(filters)])
+    if sample_rate:
+        cmd.extend(["-ar", str(sample_rate)])
+    if audio_format == "mp3":
+        cmd.extend(["-codec:a", "libmp3lame", "-b:a", "128k"])
+    else:
+        cmd.extend(["-codec:a", "pcm_s16le"])
+    cmd.append(str(target))
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio conversion failed: {result.stderr.strip()}")
+    return str(target)
+
+def handle_speech_synthesizer_payload(data: dict):
+    if not isinstance(data, dict):
+        return jsonify({"code": "InvalidParameter", "message": "Request body must be JSON object."}), 400
+
+    input_payload = data.get("input") or {}
+    if not isinstance(input_payload, dict):
+        return jsonify({"code": "InvalidParameter", "message": "input must be an object."}), 400
+
+    voice = (input_payload.get("voice") or data.get("voice") or "").strip()
+    profile = app.config.get("voice_profiles", {}).get(voice, {})
+    language_hints = (
+        input_payload.get("language_hints")
+        or profile.get("language_hints")
+        or profile.get("language_hint")
+    )
+    raw_text = input_payload.get("text")
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
+    if not text or not voice:
+        return jsonify({"code": "InvalidParameter", "message": "Missing required input.text or input.voice."}), 400
+    text = apply_language_hint(text, language_hints)
+
+    args = app.config["args"]
+    try:
+        tts_type, profile_params = resolve_voice_profile(voice, input_payload, args)
+    except Exception as e:
+        return jsonify({"code": "InvalidParameter", "message": str(e)}), 400
+
+    params = {
+        "text": text,
+        **profile_params,
+    }
+
+    try:
+        audio_format = (input_payload.get("format") or data.get("response_format") or "wav").strip().lower()
+        sample_rate = parse_optional_int(input_payload.get("sample_rate"), "sample_rate")
+        volume = parse_optional_int(input_payload.get("volume"), "volume")
+        pitch = parse_optional_float(input_payload.get("pitch"), "pitch")
+        filename = f"dashscope-{len(text)}-{time.time()}-{random.randint(1000,99999)}.wav"
+        outfile = batch(tts_type=tts_type, outname=filename, params=params, args=args)
+        outfile = convert_generated_audio(
+            outfile,
+            audio_format,
+            sample_rate=sample_rate,
+            volume=volume,
+            pitch=pitch,
+        )
+        return jsonify(dashscope_response(
+            outfile,
+            model=data.get("model", "cosyvoice-local"),
+            voice=voice,
+            audio_format=audio_format,
+        ))
+    except ValueError as e:
+        return jsonify({"code": "InvalidParameter", "message": str(e)}), 400
+    except Exception as e:
+        app.logger.error(f"SpeechSynthesizer Error: {e}", exc_info=True)
+        return jsonify({"code": e.__class__.__name__, "message": str(e)}), 500
 
 def get_params(req, args):
     output_dir = Path(args.output_dir)
@@ -158,40 +466,62 @@ def batch(tts_type, outname, params, args):
 
     if tts_type == 'tts':
         load_model('sft', args)
+    elif tts_type == 'instruct':
+        load_model('instruct', args)
     else:
         load_model('tts', args)
 
-    model = sft_model if tts_type == 'tts' else tts_model
+    if tts_type == 'tts':
+        model = sft_model
+    elif tts_type == 'instruct':
+        model = instruct_model
+    else:
+        model = tts_model
 
     prompt_speech_16k = None
-    if tts_type != 'tts':
-        ref_audio_path_str = params['reference_audio']
-        if not ref_audio_path_str:
+    zero_shot_spk_id = params.get('zero_shot_spk_id', '')
+    if tts_type not in {'tts', 'instruct'}:
+        ref_audio_path_str = params.get('reference_audio')
+        if not ref_audio_path_str and not zero_shot_spk_id:
             raise Exception('参考音频未传入。')
 
-        # FIX: Clearer variable names to avoid confusion
-        user_provided_path = Path(ref_audio_path_str)
-        full_ref_path = user_provided_path
-        if not user_provided_path.is_absolute():
-            full_ref_path = reference_dir / user_provided_path
+        if ref_audio_path_str:
+            # FIX: Clearer variable names to avoid confusion
+            user_provided_path = Path(ref_audio_path_str)
+            full_ref_path = user_provided_path
+            if not user_provided_path.is_absolute():
+                full_ref_path = reference_dir / user_provided_path
 
-        if not full_ref_path.exists():
-            raise Exception(f'参考音频不存在: {full_ref_path}')
+            if not full_ref_path.exists():
+                raise Exception(f'参考音频不存在: {full_ref_path}')
 
-        # Align with webui.py by removing the explicit ffmpeg call.
-        # The load_wav function is expected to handle resampling.
-        # Also, use model.sample_rate for postprocessing padding to match webui.py.
-        prompt_speech_16k = postprocess(load_wav(str(full_ref_path), 16000), sample_rate=model.sample_rate)
+            # Align with webui.py by removing the explicit ffmpeg call.
+            # The load_wav function is expected to handle resampling.
+            # Also, use model.sample_rate for postprocessing padding to match webui.py.
+            prompt_speech_16k = postprocess(load_wav(str(full_ref_path), 16000), sample_rate=model.sample_rate)
 
     text = params['text']
     audio_list = []
+    text_frontend = bool(params.get('text_frontend', True))
 
     if tts_type == 'tts':
-        inference_stream = model.inference_sft(text, params['role'], stream=False, speed=params['speed'])
-    elif tts_type == 'clone_eq' and params.get('reference_text'):
-        inference_stream = model.inference_zero_shot(text, params.get('reference_text'), prompt_speech_16k, stream=False, speed=params['speed'])
+        inference_stream = model.inference_sft(text, params['role'], stream=False, speed=params['speed'], text_frontend=text_frontend)
+    elif tts_type == 'clone_eq' and (params.get('reference_text') or zero_shot_spk_id):
+        inference_stream = model.inference_zero_shot(text, params.get('reference_text'), prompt_speech_16k, zero_shot_spk_id=zero_shot_spk_id, stream=False, speed=params['speed'], text_frontend=text_frontend)
+    elif tts_type == 'clone_eq':
+        raise Exception('同语言克隆必须配置 reference_text，或配置已保存的 zero_shot_spk_id。')
+    elif tts_type == 'instruct2':
+        instruction = params.get('instruction')
+        if not instruction:
+            raise Exception('CosyVoice instruct2 模式必须配置 instruction。')
+        inference_stream = model.inference_instruct2(text, instruction, prompt_speech_16k, zero_shot_spk_id=zero_shot_spk_id, stream=False, speed=params['speed'], text_frontend=text_frontend)
+    elif tts_type == 'instruct':
+        instruction = params.get('instruction')
+        if not instruction:
+            raise Exception('CosyVoice instruct 模式必须配置 instruction。')
+        inference_stream = model.inference_instruct(text, params['role'], instruction, stream=False, speed=params['speed'], text_frontend=text_frontend)
     else:  # clone_mul
-        inference_stream = model.inference_cross_lingual(text, prompt_speech_16k, stream=False, speed=params['speed'])
+        inference_stream = model.inference_cross_lingual(text, prompt_speech_16k, zero_shot_spk_id=zero_shot_spk_id, stream=False, speed=params['speed'], text_frontend=text_frontend)
 
     for i, j in enumerate(inference_stream):
         audio_list.append(j['tts_speech'])
@@ -214,6 +544,9 @@ def batch(tts_type, outname, params, args):
 
 @app.route('/tts', methods=['GET', 'POST'])
 def tts():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
     try:
         params = get_params(request, app.config['args'])
         if not params['text']:
@@ -228,6 +561,9 @@ def tts():
 @app.route('/clone_mul', methods=['GET', 'POST'])
 @app.route('/clone', methods=['GET', 'POST'])
 def clone():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
     try:
         params = get_params(request, app.config['args'])
         if not params['text']:
@@ -241,6 +577,9 @@ def clone():
 
 @app.route('/clone_eq', methods=['GET', 'POST'])
 def clone_eq():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
     try:
         params = get_params(request, app.config['args'])
         if not params['text']:
@@ -257,6 +596,9 @@ def clone_eq():
 @app.route('/v1/audio/speech', methods=['POST'])
 def audio_speech():
     import random
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
     if not request.is_json: return jsonify({"error": "请求必须是 JSON 格式"}), 400
     data = request.get_json()
     if 'input' not in data or 'voice' not in data: return jsonify({"error": "请求缺少必要的参数： input, voice"}), 400
@@ -281,6 +623,15 @@ def audio_speech():
         app.logger.error(f"OpenAI API Error: {e}", exc_info=True)
         return jsonify({"error": {"message": str(e), "type": e.__class__.__name__}}), 500
 
+@app.route('/api/v1/services/audio/tts/SpeechSynthesizer', methods=['POST'])
+def speech_synthesizer():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+    if not request.is_json:
+        return jsonify({"code": "InvalidParameter", "message": "Request must be JSON."}), 400
+    return handle_speech_synthesizer_payload(request.get_json())
+
 # --- Main Execution ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="CosyVoice API Server", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -289,12 +640,18 @@ if __name__ == '__main__':
     parser.add_argument('--models-dir', type=str, default='./pretrained_models', help='Directory to store and load models from.')
     parser.add_argument('--output-dir', type=str, default='./tmp', help='Directory to save generated audio files.')
     parser.add_argument('--refer-audio-dir', type=str, default='.', dest='refer_audio_dir', help='Base directory for reference audio files.')
+    parser.add_argument('--public-base-url', type=str, default='', help='Public base URL clients can use to download generated audio, e.g. https://tts.example.com.')
+    parser.add_argument('--api-key', type=str, default=os.environ.get('COSYVOICE_API_KEY', DEFAULT_API_KEY), help='Bearer token required for generation endpoints. Defaults to COSYVOICE_API_KEY or the built-in PPT Master local key.')
+    parser.add_argument('--voices-config', type=str, default=None, help='JSON file mapping public voice ids to server-side CosyVoice profiles.')
+    parser.add_argument('--strict-voice-profiles', action='store_true', help='Reject unknown voices instead of treating them as reference audio paths.')
     parser.add_argument('--seed', type=int, default=-1, help='Global random seed. -1 for random. Overridden by seed in API call.')
-    parser.add_argument('--preload-models', nargs='*', choices=['sft', 'tts'], default=[], help='Space-separated list of models to preload at startup (e.g., sft tts).')
+    parser.add_argument('--preload-models', nargs='*', choices=['sft', 'tts', 'instruct'], default=[], help='Space-separated list of models to preload at startup (e.g., sft tts instruct).')
     parser.add_argument('--disable-download', action='store_true', help='Disable automatic model downloading.')
     args = parser.parse_args()
 
     app.config['args'] = args
+    app.config['voice_profiles'] = load_voice_profiles(args.voices_config)
+    app.config['strict_voice_profiles'] = args.strict_voice_profiles
 
     output_dir = Path(args.output_dir)
     logs_dir = output_dir / 'logs'
@@ -319,6 +676,9 @@ if __name__ == '__main__':
     print(f"- Models Dir: {Path(args.models_dir).resolve()}")
     print(f"- Output Dir: {Path(args.output_dir).resolve()}")
     print(f"- Reference Dir: {Path(args.refer_audio_dir).resolve()}")
+    print(f"- Public Base URL: {args.public_base_url or 'request host'}")
+    print(f"- API Key Auth: {'Enabled' if args.api_key else 'Disabled'}")
+    print(f"- Voice Profiles: {len(app.config['voice_profiles'])}")
     print(f"- Preloaded models: {args.preload_models if args.preload_models else 'None'}")
     print(f"- Auto-download: {'Disabled' if args.disable_download else 'Enabled'}")
     print(f"- API running at: http://{args.host}:{args.port}")
