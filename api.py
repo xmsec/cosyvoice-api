@@ -10,11 +10,11 @@ import base64
 import json
 import librosa
 import random
+import wave
 from cosyvoice.utils.common import set_all_random_seed
 
 import torch
-import torchaudio
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
 
 # --- Global Model Placeholders ---
 sft_model = None
@@ -143,6 +143,28 @@ def postprocess(speech, sample_rate, top_db=60, hop_length=220, win_length=440):
     ], dim=1)
     return speech
 
+def save_wav_pcm16(output_path: Path, audio_data: torch.Tensor, sample_rate: int):
+    """Save channel-first float tensor audio as a standard PCM16 WAV file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if audio_data.dim() == 1:
+        audio_data = audio_data.unsqueeze(0)
+    if audio_data.dim() != 2:
+        raise ValueError(f"Expected audio tensor with shape [channels, frames], got {tuple(audio_data.shape)}")
+
+    audio_data = audio_data.detach().cpu()
+    if audio_data.dtype.is_floating_point:
+        audio_data = audio_data.clamp(-1.0, 1.0).mul(32767.0).round().to(torch.int16)
+    else:
+        audio_data = audio_data.to(torch.int16)
+
+    channels = int(audio_data.shape[0])
+    interleaved = audio_data.transpose(0, 1).contiguous()
+    with wave.open(str(output_path), "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sample_rate))
+        wav_file.writeframes(interleaved.numpy().tobytes())
+
 def base64_to_wav(encoded_str, output_path: Path):
     if not encoded_str: raise ValueError("Base64 encoded string is empty.")
     wav_bytes = base64.b64decode(encoded_str)
@@ -190,6 +212,12 @@ def normalize_tts_type(mode: str | None) -> str:
 def normalize_instruction(instruction: str | None, *, append_end_marker: bool = True) -> str:
     value = (instruction or "").strip()
     if value and append_end_marker and "<|endofprompt|>" not in value:
+        value += "<|endofprompt|>"
+    return value
+
+def normalize_prompt_text(prompt_text: str | None) -> str:
+    value = (prompt_text or "").strip()
+    if value and "<|endofprompt|>" not in value:
         value += "<|endofprompt|>"
     return value
 
@@ -250,7 +278,7 @@ def resolve_voice_profile(voice: str, input_payload: dict, args) -> tuple[str, d
         params = {
             "role": profile.get("role") or profile.get("speaker") or "中文女",
             "reference_audio": profile.get("reference_audio"),
-            "reference_text": profile.get("reference_text") or profile.get("prompt_text") or "",
+            "reference_text": normalize_prompt_text(profile.get("reference_text") or profile.get("prompt_text")),
             "instruction": normalize_instruction(instruction, append_end_marker=append_end_marker),
             "zero_shot_spk_id": profile.get("zero_shot_spk_id") or "",
             "text_frontend": bool(profile.get("text_frontend", True)),
@@ -290,10 +318,9 @@ def resolve_voice_profile(voice: str, input_payload: dict, args) -> tuple[str, d
 
 def build_audio_url(outfile: str) -> str:
     filename = Path(outfile).name
-    static_prefix = app.static_url_path.rstrip("/")
     public_base_url = (getattr(app.config.get("args"), "public_base_url", "") or "").rstrip("/")
     base_url = public_base_url or request.url_root.rstrip("/")
-    return base_url + f"{static_prefix}/{filename}"
+    return base_url + f"/outputs/{filename}"
 
 def dashscope_response(outfile: str, *, model: str, voice: str, audio_format: str) -> dict:
     return {
@@ -503,19 +530,18 @@ def batch(tts_type, outname, params, args):
             if not full_ref_path.exists():
                 raise Exception(f'参考音频不存在: {full_ref_path}')
 
-            # Align with webui.py by removing the explicit ffmpeg call.
-            # The load_wav function is expected to handle resampling.
-            # Also, use model.sample_rate for postprocessing padding to match webui.py.
-            prompt_speech_16k = postprocess(load_wav(str(full_ref_path), 16000), sample_rate=model.sample_rate)
+            # Newer CosyVoice frontends load and resample prompt_wav internally.
+            prompt_speech_16k = str(full_ref_path)
 
     text = params['text']
     audio_list = []
     text_frontend = bool(params.get('text_frontend', True))
+    reference_text = normalize_prompt_text(params.get('reference_text'))
 
     if tts_type == 'tts':
         inference_stream = model.inference_sft(text, params['role'], stream=False, speed=params['speed'], text_frontend=text_frontend)
-    elif tts_type == 'clone_eq' and (params.get('reference_text') or zero_shot_spk_id):
-        inference_stream = model.inference_zero_shot(text, params.get('reference_text'), prompt_speech_16k, zero_shot_spk_id=zero_shot_spk_id, stream=False, speed=params['speed'], text_frontend=text_frontend)
+    elif tts_type == 'clone_eq' and (reference_text or zero_shot_spk_id):
+        inference_stream = model.inference_zero_shot(text, reference_text, prompt_speech_16k, zero_shot_spk_id=zero_shot_spk_id, stream=False, speed=params['speed'], text_frontend=text_frontend)
     elif tts_type == 'clone_eq':
         raise Exception('同语言克隆必须配置 reference_text，或配置已保存的 zero_shot_spk_id。')
     elif tts_type == 'instruct2':
@@ -542,8 +568,7 @@ def batch(tts_type, outname, params, args):
 
     output_path = output_dir / outname
 
-    # Use torchaudio's save function with soundfile backend to avoid deprecation warning
-    torchaudio.save(str(output_path), audio_data, sample_rate, format="wav", backend='soundfile')
+    save_wav_pcm16(output_path, audio_data, sample_rate)
 
     print(f"音频文件生成成功：{output_path}")
     return str(output_path)
@@ -639,6 +664,12 @@ def speech_synthesizer():
     if not request.is_json:
         return jsonify({"code": "InvalidParameter", "message": "Request must be JSON."}), 400
     return handle_speech_synthesizer_payload(request.get_json())
+
+@app.route('/outputs/<path:filename>', methods=['GET'])
+def generated_audio(filename):
+    args = app.config.get('args')
+    output_dir = Path(getattr(args, 'output_dir', './tmp')).resolve()
+    return send_from_directory(str(output_dir), filename, as_attachment=False)
 
 # --- Main Execution ---
 if __name__ == '__main__':
