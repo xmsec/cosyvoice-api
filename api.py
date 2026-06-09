@@ -217,8 +217,25 @@ def normalize_instruction(instruction: str | None, *, append_end_marker: bool = 
 
 def normalize_prompt_text(prompt_text: str | None) -> str:
     value = (prompt_text or "").strip()
+    if not value:
+        return ""
+    marker = "<|endofprompt|>"
+    if marker not in value:
+        return f"You are a helpful assistant.{marker}{value}"
+
+    before, after = value.split(marker, 1)
+    before = before.strip()
+    after = after.strip()
+    if after:
+        return f"{before}{marker}{after}"
+    if before:
+        return f"You are a helpful assistant.{marker}{before}"
+    return value
+
+def normalize_cosyvoice3_text(text: str | None) -> str:
+    value = (text or "").strip()
     if value and "<|endofprompt|>" not in value:
-        value += "<|endofprompt|>"
+        value = f"You are a helpful assistant.<|endofprompt|>{value}"
     return value
 
 def normalize_language_hint(language_hints) -> str:
@@ -534,6 +551,8 @@ def batch(tts_type, outname, params, args):
             prompt_speech_16k = str(full_ref_path)
 
     text = params['text']
+    if tts_type == 'clone_mul':
+        text = normalize_cosyvoice3_text(text)
     audio_list = []
     text_frontend = bool(params.get('text_frontend', True))
     reference_text = normalize_prompt_text(params.get('reference_text'))
